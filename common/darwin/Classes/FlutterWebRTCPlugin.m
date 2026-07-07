@@ -413,6 +413,16 @@ static FlutterWebRTCPlugin *sharedSingleton;
     NSDictionary* argsMap = call.arguments;
     NSDictionary* constraints = argsMap[@"constraints"];
     [self getDisplayMedia:constraints result:result];
+  } else if ([@"getDisplayMediaWithPicker" isEqualToString:call.method]) {
+    // VGV fork (vgv/macos-window-capture): present SCContentSharingPicker and
+    // capture the exact selection (display / window / application).
+#if TARGET_OS_OSX
+    [self getDisplayMediaWithPicker:result];
+#else
+    result([FlutterError errorWithCode:@"ERROR"
+                               message:@"getDisplayMediaWithPicker is macOS-only"
+                               details:nil]);
+#endif
   } else if ([@"requestCapturePermission" isEqualToString:call.method]) {
 #if TARGET_OS_OSX || TARGET_OS_MACCATALYST
     if (@available(macOS 10.15, macCatalyst 13.1, *)) {

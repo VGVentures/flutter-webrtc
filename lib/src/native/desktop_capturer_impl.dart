@@ -3,17 +3,26 @@ import 'dart:typed_data';
 
 import '../desktop_capturer.dart';
 import 'event_channel.dart';
+import 'media_stream_impl.dart';
 import 'utils.dart';
 
 class DesktopCapturerSourceNative extends DesktopCapturerSource {
   DesktopCapturerSourceNative(
-      this._id, this._name, this._thumbnailSize, this._type);
+    this._id,
+    this._name,
+    this._thumbnailSize,
+    this._type,
+  );
   factory DesktopCapturerSourceNative.fromMap(Map<dynamic, dynamic> map) {
     var sourceType = (map['type'] as String) == 'window'
         ? SourceType.Window
         : SourceType.Screen;
-    var source = DesktopCapturerSourceNative(map['id'], map['name'],
-        ThumbnailSize.fromMap(map['thumbnailSize']), sourceType);
+    var source = DesktopCapturerSourceNative(
+      map['id'],
+      map['name'],
+      ThumbnailSize.fromMap(map['thumbnailSize']),
+      sourceType,
+    );
     if (map['thumbnail'] != null) {
       source.thumbnail = map['thumbnail'] as Uint8List;
     }
@@ -21,8 +30,9 @@ class DesktopCapturerSourceNative extends DesktopCapturerSource {
   }
 
   //ignore: close_sinks
-  final StreamController<String> _onNameChanged =
-      StreamController.broadcast(sync: true);
+  final StreamController<String> _onNameChanged = StreamController.broadcast(
+    sync: true,
+  );
 
   @override
   StreamController<String> get onNameChanged => _onNameChanged;
@@ -97,8 +107,24 @@ class DesktopCapturerNative extends DesktopCapturer {
 
   final Map<String, DesktopCapturerSourceNative> _sources = {};
 
+  // VGV fork (vgv/macos-window-capture): OS-initiated stops of a picker
+  // capture (system "Stop Sharing", source window closed) surface here.
+  final StreamController<String> _onSelectedSourceStopped =
+      StreamController.broadcast(sync: true);
+
+  @override
+  Stream<String> get onSelectedSourceStopped => _onSelectedSourceStopped.stream;
+
   void handleEvent(String event, Map<dynamic, dynamic> map) async {
     switch (event) {
+      case 'selectedSourceStopped':
+        // VGV fork: a picker-started capture stopped outside the app's
+        // control; surface its trackId so the app can unpublish.
+        final trackId = map['trackId'] as String?;
+        if (trackId != null) {
+          _onSelectedSourceStopped.add(trackId);
+        }
+        break;
       case 'desktopSourceAdded':
         final source = DesktopCapturerSourceNative.fromMap(map);
         if (_sources[source.id] == null) {
@@ -142,8 +168,10 @@ class DesktopCapturerNative extends DesktopCapturer {
   }
 
   @override
-  Future<List<DesktopCapturerSource>> getSources(
-      {required List<SourceType> types, ThumbnailSize? thumbnailSize}) async {
+  Future<List<DesktopCapturerSource>> getSources({
+    required List<SourceType> types,
+    ThumbnailSize? thumbnailSize,
+  }) async {
     _sources.clear();
     final response = await WebRTC.invokeMethod(
       'getDesktopSources',
@@ -176,6 +204,48 @@ class DesktopCapturerNative extends DesktopCapturer {
     return response['result'] as bool;
   }
 
+  // VGV fork addition (vgv/macos-window-capture).
+  @override
+  Future<PickedDisplayMedia?> pickAndCaptureDisplayMedia() async {
+    final response = await WebRTC.invokeMethod(
+      'getDisplayMediaWithPicker',
+      <String, dynamic>{},
+    );
+    if (response == null) {
+      throw Exception('getDisplayMediaWithPicker returned null');
+    }
+    // The user dismissed the picker without choosing — a no-op, not an error.
+    if (response['cancelled'] == true) {
+      return null;
+    }
+    final streamId = response['streamId'] as String;
+    final stream = MediaStreamNative(streamId, 'local');
+    stream.setMediaTracks(response['audioTracks'], response['videoTracks']);
+    final videoTracks = response['videoTracks'] as List<dynamic>;
+    final trackId = videoTracks.first['id'] as String;
+    final source = response['source'] as Map<dynamic, dynamic>?;
+    final kind = _pickedKindFromString(source?['kind'] as String?);
+    final name = (source?['name'] as String?) ?? '';
+    return PickedDisplayMedia(
+      stream: stream,
+      trackId: trackId,
+      kind: kind,
+      sourceName: name,
+    );
+  }
+
+  static PickedSourceKind _pickedKindFromString(String? value) {
+    switch (value) {
+      case 'window':
+        return PickedSourceKind.window;
+      case 'application':
+        return PickedSourceKind.application;
+      case 'display':
+      default:
+        return PickedSourceKind.display;
+    }
+  }
+
   Future<Uint8List?> getThumbnail(DesktopCapturerSourceNative source) async {
     final response = await WebRTC.invokeMethod(
       'getDesktopSourceThumbnail',
@@ -183,8 +253,8 @@ class DesktopCapturerNative extends DesktopCapturer {
         'sourceId': source.id,
         'thumbnailSize': {
           'width': source.thumbnailSize.width,
-          'height': source.thumbnailSize.height
-        }
+          'height': source.thumbnailSize.height,
+        },
       },
     );
     if (response == null || !response is Uint8List?) {

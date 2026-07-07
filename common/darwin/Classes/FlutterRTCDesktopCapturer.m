@@ -12,12 +12,33 @@
 #import "LocalVideoTrack.h"
 #if TARGET_OS_OSX
 #import "FlutterScreenCaptureKitCapturer.h"
+#if __has_include(<ScreenCaptureKit/ScreenCaptureKit.h>)
+#import <ScreenCaptureKit/ScreenCaptureKit.h>
+#endif
 #endif
 
 #if TARGET_OS_OSX
 RTCDesktopMediaList* _screen = nil;
 RTCDesktopMediaList* _window = nil;
 NSArray<RTCDesktopSource*>* _captureSources;
+#endif
+
+#if TARGET_OS_OSX && __has_include(<ScreenCaptureKit/ScreenCaptureKit.h>)
+// VGV fork addition (vgv/macos-window-capture): drives one presentation of the
+// macOS-native SCContentSharingPicker and, on the Member's pick, starts a
+// ScreenCaptureKit capture of that exact SCContentFilter (display / window /
+// application). The picker singleton holds only a weak observer reference, so
+// the object retains itself in `activeObserver` for the interaction's lifetime
+// and releases on the first terminal callback.
+API_AVAILABLE(macos(14.0))
+@interface FlutterWebRTCScreenSharePicker : NSObject <SCContentSharingPickerObserver>
+@property(nonatomic, weak) FlutterWebRTCPlugin* plugin;
+@property(nonatomic, copy) FlutterResult result;
+@property(nonatomic, assign) BOOL finished;
++ (void)presentForPlugin:(FlutterWebRTCPlugin*)plugin result:(FlutterResult)result;
+@end
+
+static FlutterWebRTCScreenSharePicker* _activeScreenSharePicker API_AVAILABLE(macos(14.0));
 #endif
 
 @implementation FlutterWebRTCPlugin (DesktopCapturer)
@@ -205,6 +226,22 @@ NSArray<RTCDesktopSource*>* _captureSources;
   result(
       @{@"streamId" : mediaStreamId, @"audioTracks" : audioTracks, @"videoTracks" : videoTracks});
 }
+
+#if TARGET_OS_OSX
+// VGV fork addition (vgv/macos-window-capture).
+- (void)getDisplayMediaWithPicker:(FlutterResult)result {
+#if __has_include(<ScreenCaptureKit/ScreenCaptureKit.h>)
+  if (@available(macOS 14.0, *)) {
+    [FlutterWebRTCScreenSharePicker presentForPlugin:self result:result];
+    return;
+  }
+#endif
+  result([FlutterError
+      errorWithCode:@"unavailable"
+            message:@"SCContentSharingPicker requires macOS 14.0 or newer"
+            details:nil]);
+}
+#endif
 
 - (void)getDesktopSources:(NSDictionary*)argsMap result:(FlutterResult)result {
 #if TARGET_OS_OSX
@@ -468,3 +505,180 @@ NSArray<RTCDesktopSource*>* _captureSources;
 #endif
 
 @end
+
+#if TARGET_OS_OSX && __has_include(<ScreenCaptureKit/ScreenCaptureKit.h>)
+// VGV fork addition (vgv/macos-window-capture): SCContentSharingPicker driver.
+@implementation FlutterWebRTCScreenSharePicker
+
++ (void)presentForPlugin:(FlutterWebRTCPlugin*)plugin
+                  result:(FlutterResult)result API_AVAILABLE(macos(14.0)) {
+  dispatch_async(dispatch_get_main_queue(), ^{
+    // Only one picker at a time; a second request resolves as a cancel so the
+    // caller does not hang.
+    if (_activeScreenSharePicker != nil) {
+      result(@{@"cancelled" : @YES});
+      return;
+    }
+    FlutterWebRTCScreenSharePicker* observer =
+        [[FlutterWebRTCScreenSharePicker alloc] init];
+    observer.plugin = plugin;
+    observer.result = result;
+    _activeScreenSharePicker = observer;
+
+    SCContentSharingPicker* picker = SCContentSharingPicker.sharedPicker;
+    SCContentSharingPickerConfiguration* config =
+        [[SCContentSharingPickerConfiguration alloc] init];
+    // Offer the full Meet-style set: a single window, an application, or a
+    // whole display.
+    config.allowedPickerModes = SCContentSharingPickerModeSingleWindow |
+                                SCContentSharingPickerModeSingleApplication |
+                                SCContentSharingPickerModeSingleDisplay;
+    picker.defaultConfiguration = config;
+    [picker addObserver:observer];
+    picker.active = YES;
+    [picker present];
+  });
+}
+
+- (void)finishWithResult:(id)value API_AVAILABLE(macos(14.0)) {
+  if (self.finished) {
+    return;
+  }
+  self.finished = YES;
+  [SCContentSharingPicker.sharedPicker removeObserver:self];
+  SCContentSharingPicker.sharedPicker.active = NO;
+  FlutterResult result = self.result;
+  self.result = nil;
+  _activeScreenSharePicker = nil;
+  if (result != nil) {
+    result(value);
+  }
+}
+
+// SCContentSharingPickerObserver
+
+- (void)contentSharingPicker:(SCContentSharingPicker*)picker
+         didUpdateWithFilter:(SCContentFilter*)filter
+                   forStream:(SCStream*)stream API_AVAILABLE(macos(14.0)) {
+  if (self.finished) {
+    return;
+  }
+  FlutterWebRTCPlugin* plugin = self.plugin;
+  if (plugin == nil) {
+    [self finishWithResult:@{@"cancelled" : @YES}];
+    return;
+  }
+
+  // Build the WebRTC track exactly as getDisplayMedia does, then drive an
+  // SCStream on the picked filter into the same RTCVideoSource. This reuses
+  // the plugin's shared factory + track registry, so LiveKit/publish adopts
+  // the track by id with no other changes.
+  NSString* mediaStreamId = [[NSUUID UUID] UUIDString];
+  RTCMediaStream* mediaStream =
+      [plugin.peerConnectionFactory mediaStreamWithStreamId:mediaStreamId];
+  RTCVideoSource* videoSource =
+      [plugin.peerConnectionFactory videoSourceForScreenCast:YES];
+  NSString* trackUUID = [[NSUUID UUID] UUIDString];
+  VideoProcessingAdapter* videoProcessingAdapter =
+      [[VideoProcessingAdapter alloc] initWithRTCVideoSource:videoSource];
+
+  FlutterScreenCaptureKitCapturer* capturer =
+      [[FlutterScreenCaptureKitCapturer alloc]
+          initWithDelegate:videoProcessingAdapter];
+
+  __weak FlutterWebRTCPlugin* weakPlugin = plugin;
+  [capturer
+      startCaptureWithFilter:filter
+                         fps:30
+                   onStarted:^(NSError* _Nullable error) {
+                     if (error != nil) {
+                       NSLog(@"screenshare picker capture start failed: %@",
+                             error);
+                       [self finishWithResult:[FlutterError
+                                                  errorWithCode:@"capture-failed"
+                                                        message:error
+                                                                    .localizedDescription
+                                                        details:nil]];
+                       return;
+                     }
+                   }
+                   onStopped:^{
+                     // OS-initiated stop (system "Stop Sharing" / window
+                     // closed). Drop the track + tell Dart to unpublish.
+                     FlutterWebRTCPlugin* p = weakPlugin;
+                     if (p == nil) {
+                       return;
+                     }
+                     [p.localTracks removeObjectForKey:trackUUID];
+                     [p.videoCapturerStopHandlers removeObjectForKey:trackUUID];
+                     postEvent(p.eventSink, @{
+                       @"event" : @"selectedSourceStopped",
+                       @"trackId" : trackUUID,
+                     });
+                   }];
+
+  RTCVideoTrack* videoTrack =
+      [plugin.peerConnectionFactory videoTrackWithSource:videoSource
+                                                 trackId:trackUUID];
+  [mediaStream addVideoTrack:videoTrack];
+  LocalVideoTrack* localVideoTrack =
+      [[LocalVideoTrack alloc] initWithTrack:videoTrack
+                             videoProcessing:videoProcessingAdapter];
+  plugin.localTracks[trackUUID] = localVideoTrack;
+
+  // Explicit-stop handler so the app's stop path (and leaving the huddle)
+  // tears the SCStream down.
+  plugin.videoCapturerStopHandlers[trackUUID] = ^(CompletionHandler handler) {
+    [capturer stopCaptureWithCompletion:handler];
+  };
+  plugin.localStreams[mediaStreamId] = mediaStream;
+
+  NSString* kind;
+  switch (filter.style) {
+    case SCShareableContentStyleWindow:
+      kind = @"window";
+      break;
+    case SCShareableContentStyleApplication:
+      kind = @"application";
+      break;
+    case SCShareableContentStyleDisplay:
+    default:
+      kind = @"display";
+      break;
+  }
+
+  NSMutableArray* videoTracks = [NSMutableArray array];
+  for (RTCVideoTrack* track in mediaStream.videoTracks) {
+    [videoTracks addObject:@{
+      @"id" : track.trackId,
+      @"kind" : track.kind,
+      @"label" : track.trackId,
+      @"enabled" : @(track.isEnabled),
+      @"remote" : @(NO),
+      @"readyState" : @"live",
+    }];
+  }
+
+  [self finishWithResult:@{
+    @"streamId" : mediaStreamId,
+    @"audioTracks" : @[],
+    @"videoTracks" : videoTracks,
+    @"source" : @{@"kind" : kind, @"name" : @""},
+  }];
+}
+
+- (void)contentSharingPicker:(SCContentSharingPicker*)picker
+           didCancelForStream:(SCStream*)stream API_AVAILABLE(macos(14.0)) {
+  // The Member dismissed the picker without choosing — a no-op.
+  [self finishWithResult:@{@"cancelled" : @YES}];
+}
+
+- (void)contentSharingPickerStartDidFailWithError:(NSError*)error
+    API_AVAILABLE(macos(14.0)) {
+  [self finishWithResult:[FlutterError errorWithCode:@"capture-failed"
+                                             message:error.localizedDescription
+                                             details:nil]];
+}
+
+@end
+#endif
