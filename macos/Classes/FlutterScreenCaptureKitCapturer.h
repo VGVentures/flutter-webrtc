@@ -22,10 +22,10 @@
 // "Stop Sharing" control, or the source window closes) so the caller can
 // tear the published track down.
 #if __has_include(<ScreenCaptureKit/ScreenCaptureKit.h>)
-- (void)startCaptureWithFilter:(SCContentFilter*)filter
+- (void)startCaptureWithFilter:(SCContentFilter* _Nonnull)filter
                            fps:(NSInteger)fps
-                     onStarted:(void (^)(NSError* _Nullable error))onStarted
-                     onStopped:(void (^)(void))onStopped
+                     onStarted:(void (^_Nonnull)(NSError* _Nullable error))onStarted
+                     onStopped:(void (^_Nonnull)(void))onStopped
     API_AVAILABLE(macos(14.0));
 #endif
 
