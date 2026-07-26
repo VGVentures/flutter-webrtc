@@ -9,6 +9,11 @@
 #import "FlutterRTCPeerConnection.h"
 #import "FlutterRTCVideoRenderer.h"
 #import "FlutterRTCFrameCryptor.h"
+#if TARGET_OS_OSX
+// VGV fork addition (vgv/macos-window-capture): native RTCMTLNSVideoView bridge
+// for the huddle video overlay. macOS-only; lives in macos/Classes.
+#import "FlutterRTCNativeVideoView.h"
+#endif
 #if TARGET_OS_IPHONE
 #import "FlutterRTCMediaRecorder.h"
 #import "FlutterRTCVideoPlatformViewFactory.h"
@@ -421,6 +426,18 @@ static FlutterWebRTCPlugin *sharedSingleton;
 #else
     result([FlutterError errorWithCode:@"ERROR"
                                message:@"getDisplayMediaWithPicker is macOS-only"
+                               details:nil]);
+#endif
+  } else if ([call.method hasPrefix:@"nativeVideoView"]) {
+    // VGV fork (vgv/macos-window-capture): native RTCMTLNSVideoView bridge for
+    // the huddle video overlay window. macOS-only.
+#if TARGET_OS_OSX
+    if (![self handleNativeVideoViewMethodCall:call result:result]) {
+      result(FlutterMethodNotImplemented);
+    }
+#else
+    result([FlutterError errorWithCode:@"ERROR"
+                               message:@"nativeVideoView is macOS-only"
                                details:nil]);
 #endif
   } else if ([@"requestCapturePermission" isEqualToString:call.method]) {
